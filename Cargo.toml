@@ -1,0 +1,53 @@
+[package]
+name = "plasmon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+ort = { path = "../../ai-spike/ort", features = [ "fetch-models" ] }
+ndarray = "0.16"
+tracing-subscriber = { version = "0.3", default-features = false, features = [ "env-filter", "fmt" ] }
+image = "0.25"
+show-image = { version = "=0.14.0", features = [ "image", "raqote" ] }
+raqote = { version = "0.8", default-features = false }
+tracing = "0.1"
+
+# ort-candle = { path = "../../backends/candle", optional = true }
+# ort-tract = { path = "../../backends/tract", optional = true }
+
+[features]
+load-dynamic = [ "ort/load-dynamic" ]
+
+cuda = [ "ort/cuda" ]
+tensorrt = [ "ort/tensorrt" ]
+openvino = [ "ort/openvino" ]
+onednn = [ "ort/onednn" ]
+directml = [ "ort/directml" ]
+nnapi = [ "ort/nnapi" ]
+coreml = [ "ort/coreml" ]
+xnnpack = [ "ort/xnnpack" ]
+rocm = [ "ort/rocm" ]
+acl = [ "ort/acl" ]
+armnn = [ "ort/armnn" ]
+tvm = [ "ort/tvm" ]
+migraphx = [ "ort/migraphx" ]
+rknpu = [ "ort/rknpu" ]
+vitis = [ "ort/vitis" ]
+cann = [ "ort/cann" ]
+qnn = [ "ort/qnn" ]
+webgpu = [ "ort/webgpu" ]
+azure = [ "ort/azure" ]
+
+# backend-candle = [ "ort/alternative-backend", "dep:ort-candle" ]
+# backend-tract = [ "ort/alternative-backend", "dep:ort-tract" ]
+
+# Compile dependencies in release mode while keeping local code in dev mode
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+# Keep your own package in dev mode (unoptimized)
+[profile.dev.package.plasmon]
+opt-level = 0
+debug = true
