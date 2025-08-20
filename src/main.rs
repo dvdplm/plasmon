@@ -5,8 +5,10 @@ mod utils;
 
 #[allow(unused)]
 use ort::execution_providers::*;
+use tokio::sync::mpsc;
+use tracing::error;
 
-pub fn init() -> ort::Result<()> {
+pub fn init_onnx_ep() -> ort::Result<()> {
     ort::init()
         .with_execution_providers([
             #[cfg(feature = "tensorrt")]
@@ -65,6 +67,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::utils::inputs_from_image;
 
+// Define the message type for communication between tasks
+#[derive(Debug)]
+pub(crate) struct YoloResult {
+    pub(crate) bboxes: Vec<(bbox::BoundingBox, &'static str, f32)>,
+}
+
 #[rustfmt::skip]
 const YOLO_CLASS_LABELS: [&str; 80] = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
@@ -81,9 +89,7 @@ const YOLO_CLASS_LABELS: [&str; 80] = [
 const SIZE_X: u32 = 640;
 const SIZE_Y: u32 = 640;
 
-#[show_image::main]
 fn main() -> ort::Result<()> {
-    // Initialize tracing to receive debug messages from `ort`
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -92,10 +98,19 @@ fn main() -> ort::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Register EPs based on feature flags - this isn't crucial for usage and can be removed.
-    init()?;
+    show_image::run_context(|| {
+        // Initialize the tokio runtime
+        let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let original_img = image::open(
+        rt.block_on(async_main()).unwrap();
+    });
+}
+
+async fn async_main() -> ort::Result<()> {
+    // Register ONNX execution providers (EPs) based on feature flags.
+    init_onnx_ep()?;
+
+    let img = image::open(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("data")
             .join("skate-3654.jpg"),
@@ -104,8 +119,46 @@ fn main() -> ort::Result<()> {
     )
     .unwrap();
 
-    let (img_width, img_height) = (original_img.width(), original_img.height());
-    let img = original_img.resize_exact(SIZE_X, SIZE_Y, FilterType::CatmullRom);
+    let (img_width, img_height) = (img.width(), img.height());
+
+    // Create channel for communication between YOLO task and main thread
+    let (yolo_tx, mut yolo_rx) = mpsc::channel::<YoloResult>(1);
+
+    let img_yolo = img.resize_exact(SIZE_X, SIZE_Y, FilterType::CatmullRom);
+    // Spawn YOLO inference task
+    tokio::spawn(async move {
+        if let Err(e) = run_yolo_inference(img_yolo, img_width, img_height, yolo_tx).await {
+            error!("YOLO inference error: {}", e);
+        }
+    });
+
+    let yolo_result = yolo_rx
+        .recv()
+        .await
+        .expect("Failed to receive YOLO results");
+
+    let dt = bbox::draw_bboxes(yolo_result.bboxes, img_width, img_height);
+    let window = utils::show_image(img, dt, img_width, img_height);
+
+    for event in window.event_channel().unwrap() {
+        if let event::WindowEvent::KeyboardInput(event) = event {
+            if event.input.key_code == Some(event::VirtualKeyCode::Escape)
+                && event.input.state.is_pressed()
+            {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_yolo_inference(
+    img: image::DynamicImage,
+    img_width: u32,
+    img_height: u32,
+    tx: mpsc::Sender<YoloResult>,
+) -> ort::Result<()> {
     let input = inputs_from_image(&img);
 
     let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -122,17 +175,12 @@ fn main() -> ort::Result<()> {
         .into_owned();
     let findings = output.slice(s![.., .., 0]);
     let bboxes = bbox::bbox(findings, img_width, img_height);
-    let dt = bbox::draw_bboxes(bboxes, img_width, img_height);
-    let window = utils::show_image(original_img, dt, img_width, img_height);
 
-    for event in window.event_channel().unwrap() {
-        if let event::WindowEvent::KeyboardInput(event) = event {
-            if event.input.key_code == Some(event::VirtualKeyCode::Escape)
-                && event.input.state.is_pressed()
-            {
-                break;
-            }
-        }
+    // Send results back to main thread
+    let result = YoloResult { bboxes };
+
+    if let Err(_) = tx.send(result).await {
+        error!("Failed to send YOLO results to main thread");
     }
 
     Ok(())

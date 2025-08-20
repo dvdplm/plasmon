@@ -12,6 +12,7 @@ image = "0.25"
 show-image = { version = "=0.14.0", features = [ "image", "raqote" ] }
 raqote = { version = "0.8", default-features = false }
 tracing = "0.1"
+tokio = { version = "1.0", features = ["full"] }
 
 # ort-candle = { path = "../../backends/candle", optional = true }
 # ort-tract = { path = "../../backends/tract", optional = true }
