@@ -5,8 +5,9 @@ mod utils;
 
 #[allow(unused)]
 use ort::execution_providers::*;
+use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{debug, error, field::Empty, trace};
 
 pub fn init_onnx_ep() -> ort::Result<()> {
     ort::init()
@@ -53,13 +54,13 @@ pub fn init_onnx_ep() -> ort::Result<()> {
     Ok(())
 }
 
-use std::path::Path;
+use std::{collections::HashMap, net::ToSocketAddrs, path::Path};
 
 use image::imageops::FilterType;
-use ndarray::s;
+use ndarray::{Array2, Array3, Array4, s};
 use ort::{
     inputs,
-    session::{Session, SessionOutputs},
+    session::{Session, SessionInputs, SessionOutputs},
     value::TensorRef,
 };
 use show_image::event;
@@ -93,7 +94,7 @@ fn main() -> ort::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,ort=debug".into()),
+                .unwrap_or_else(|_| "info,ort=error".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -110,6 +111,13 @@ async fn async_main() -> ort::Result<()> {
     // Register ONNX execution providers (EPs) based on feature flags.
     init_onnx_ep()?;
 
+    // Gemma-3 inference here
+    tokio::spawn(async move {
+        if let Err(e) = run_gemma3_inference("something smart here").await {
+            error!("Gemma-3 inference error: {}", e);
+        }
+    });
+
     let img = image::open(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("data")
@@ -125,12 +133,12 @@ async fn async_main() -> ort::Result<()> {
     let (yolo_tx, mut yolo_rx) = mpsc::channel::<YoloResult>(1);
 
     let img_yolo = img.resize_exact(SIZE_X, SIZE_Y, FilterType::CatmullRom);
-    // Spawn YOLO inference task
-    tokio::spawn(async move {
-        if let Err(e) = run_yolo_inference(img_yolo, img_width, img_height, yolo_tx).await {
-            error!("YOLO inference error: {}", e);
-        }
-    });
+    // // Spawn YOLO inference task
+    // tokio::spawn(async move {
+    //     if let Err(e) = run_yolo_inference(img_yolo, img_width, img_height, yolo_tx).await {
+    //         error!("YOLO inference error: {}", e);
+    //     }
+    // });
 
     let yolo_result = yolo_rx
         .recv()
@@ -148,6 +156,60 @@ async fn async_main() -> ort::Result<()> {
                 break;
             }
         }
+    }
+
+    Ok(())
+}
+async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
+    let base_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join("gemma-3-1b-it-ONNX");
+    let model_path = base_path.join("onnx/model_int8.onnx");
+    let mut model = Session::builder()?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level1)?
+        .commit_from_file(model_path)?;
+
+    // INSPECT MODEL TO SEE WHAT INPUTS IT ACTUALLY NEEDS
+    println!("=== MODEL INPUTS REQUIRED ===");
+    for (i, input) in model.inputs.iter().enumerate() {
+        println!(
+            "  Input {}: '{}' | Type: {:?} ",
+            i, input.name, input.input_type
+        );
+    }
+    println!("===============================");
+
+    debug!("Built Gemma session");
+
+    let tokenizer = Tokenizer::from_file(base_path.join("tokenizer.json"))?;
+    debug!("Tokenizer ready");
+    let tokens = tokenizer.encode(input, false)?;
+    trace!("Tokens: {tokens:?}");
+    let mut tokens: Vec<_> = tokens.get_ids().iter().map(|i| *i as i64).collect();
+
+    for step in 0..90 {
+        let input_ids =
+            TensorRef::from_array_view((vec![1, tokens.len() as i64], tokens.as_slice()))?;
+        let pos_ids = (0..tokens.len() as i64).collect::<Vec<_>>();
+        let position_ids =
+            TensorRef::from_array_view((vec![1, tokens.len() as i64], pos_ids.as_slice()))?;
+
+        let mut session_inputs = inputs![
+            "input_ids" => input_ids,
+            "position_ids" => position_ids,
+        ];
+        let past_seq_len = if step == 0 { 0 } else { tokens.len() - 1 };
+        let empty_kv = Array4::<f32>::zeros((1, 1, past_seq_len, 256));
+
+        for layer in 0..26 {
+            let key = format!("past_key_values.{}.key", layer);
+            let kv = TensorRef::from_array_view(&empty_kv)?;
+            session_inputs.push((key.into(), kv.clone().into()));
+            let val = format!("past_key_values.{}.value", layer);
+            session_inputs.push((val.into(), kv.into()));
+        }
+        let outputs = model.run(session_inputs)?;
+        trace!("Output: {outputs:?}");
     }
 
     Ok(())
