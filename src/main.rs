@@ -91,10 +91,38 @@ async fn async_main() -> ort::Result<()> {
     // Register ONNX execution providers (EPs) based on feature flags.
     init_onnx_ep()?;
 
-    // Spawn filesystem watcher for 'data' folder
-    tokio::spawn(async {
-        if let Err(e) = watch_data_folder().await {
-            error!("FS watch error: {:?}", e);
+    // Channel for new JPG paths
+    let (img_tx, mut img_rx) = mpsc::channel::<std::path::PathBuf>(10);
+    // Create channel for communication between YOLO task and main thread
+    let (yolo_tx, mut yolo_rx) = mpsc::channel::<yolo::YoloResult>(1);
+
+    // Spawn filesystem watcher for 'data' folder, passing sender
+    tokio::spawn(watch_data_folder(img_tx));
+
+    // Spawn image processing task
+    tokio::spawn(async move {
+        while let Some(path) = img_rx.recv().await {
+            match image::open(&path) {
+                Ok(img) => {
+                    let img_yolo =
+                        img.resize_exact(yolo::SIZE_X, yolo::SIZE_Y, FilterType::CatmullRom);
+                    info!("YOLO inference: {:?}", path);
+                    if let Err(e) = yolo::run_inference(
+                        img_yolo,
+                        img.width(),
+                        img.height(),
+                        path,
+                        yolo_tx.clone(),
+                    )
+                    .await
+                    {
+                        error!("YOLO inference error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to open image {:?}: {}", path, e);
+                }
+            }
         }
     });
 
@@ -111,22 +139,19 @@ async fn async_main() -> ort::Result<()> {
     //         }
     //     });
 
-    let img = image::open(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("data")
-            .join("skate-3654.jpg"),
-        // .join("boywithgun.jpg"),
-        // .join("baseball.jpg"),
-    )
-    .unwrap();
+    // let img = image::open(
+    //     Path::new(env!("CARGO_MANIFEST_DIR"))
+    //         .join("data")
+    //         .join("skate-3654.jpg"),
+    //     // .join("boywithgun.jpg"),
+    //     // .join("baseball.jpg"),
+    // )
+    // .unwrap();
 
-    let (img_width, img_height) = (img.width(), img.height());
+    // let (img_width, img_height) = (img.width(), img.height());
 
-    // Create channel for communication between YOLO task and main thread
-    let (yolo_tx, mut yolo_rx) = mpsc::channel::<yolo::YoloResult>(1);
-
-    let img_yolo = img.resize_exact(yolo::SIZE_X, yolo::SIZE_Y, FilterType::CatmullRom);
-    let (w, h) = (img.height(), img.width());
+    // let img_yolo = img.resize_exact(yolo::SIZE_X, yolo::SIZE_Y, FilterType::CatmullRom);
+    // let (w, h) = (img.height(), img.width());
     // Spawn YOLO inference task
     // tokio::spawn(async move {
     //     if let Err(e) = yolo::run_inference(img_yolo, w, h, yolo_tx).await {
@@ -134,13 +159,15 @@ async fn async_main() -> ort::Result<()> {
     //     }
     // });
 
-    let yolo_result = yolo_rx
+    let yolo = yolo_rx
         .recv()
         .await
         .expect("Failed to receive YOLO results");
 
-    let dt = bbox::draw_bboxes(yolo_result.bboxes, img_width, img_height);
-    let window = utils::show_image(img, dt, img_width, img_height);
+    // TODO: kind of sucks to re-open the image like this.
+    let img = image::open(yolo.img_path).unwrap();
+    let dt = bbox::draw_bboxes(yolo.bboxes, yolo.width, yolo.height);
+    let window = utils::show_image(img, dt, yolo.width, yolo.height);
 
     for event in window.event_channel().unwrap() {
         if let event::WindowEvent::KeyboardInput(event) = event {
@@ -157,15 +184,15 @@ async fn async_main() -> ort::Result<()> {
     Ok(())
 }
 
-// Async filesystem watcher for 'data' folder
-async fn watch_data_folder() -> NotifyResult<()> {
-    let (tx, mut rx) = tokio_mpsc::channel(10);
+// Async filesystem watcher for 'data' folder, sends new JPG paths via channel
+async fn watch_data_folder(tx: mpsc::Sender<std::path::PathBuf>) -> NotifyResult<()> {
+    let (event_tx, mut event_rx) = tokio_mpsc::channel(10);
 
     // Spawn a blocking thread for the watcher
     std::thread::spawn(move || {
         let mut watcher = notify::recommended_watcher(move |res| {
             if let Ok(event) = res {
-                let _ = tx.blocking_send(event);
+                let _ = event_tx.blocking_send(event);
             }
         })
         .unwrap();
@@ -178,15 +205,13 @@ async fn watch_data_folder() -> NotifyResult<()> {
         std::thread::park();
     });
 
-    while let Some(event) = rx.recv().await {
+    while let Some(event) = event_rx.recv().await {
         if let EventKind::Create(CreateKind::File) = event.kind {
             for path in event.paths {
-                // Only flag if the file exists and is a jpg
                 if path.exists() {
                     if let Some(ext) = path.extension() {
                         if ext.to_string_lossy().eq_ignore_ascii_case("jpg") {
-                            debug!("New jpg file detected: {:?}", path);
-                            // Here you would trigger YOLO inference
+                            let _ = tx.send(path.clone()).await;
                         }
                     }
                 }

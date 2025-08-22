@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bbox;
 use crate::utils::inputs_from_image;
@@ -32,12 +32,16 @@ pub(crate) const SIZE_Y: u32 = 640;
 #[derive(Debug)]
 pub(crate) struct YoloResult {
     pub(crate) bboxes: Vec<(bbox::BoundingBox, &'static str, f32)>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) img_path: PathBuf,
 }
 
 pub(crate) async fn run_inference(
     img: image::DynamicImage,
-    img_width: u32,
-    img_height: u32,
+    width: u32,
+    height: u32,
+    img_path: PathBuf,
     tx: mpsc::Sender<YoloResult>,
 ) -> ort::Result<()> {
     let input = inputs_from_image(&img);
@@ -55,10 +59,15 @@ pub(crate) async fn run_inference(
         .t()
         .into_owned();
     let findings = output.slice(s![.., .., 0]);
-    let bboxes = bbox::bbox(findings, img_width, img_height);
+    let bboxes = bbox::bbox(findings, width, height);
 
     // Send results back to main thread
-    let result = YoloResult { bboxes };
+    let result = YoloResult {
+        bboxes,
+        width,
+        height,
+        img_path,
+    };
 
     if let Err(_) = tx.send(result).await {
         error!("Failed to send YOLO results to main thread");
