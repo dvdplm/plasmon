@@ -2,13 +2,26 @@
 
 mod bbox;
 mod utils;
+mod yolo;
 
 #[allow(unused)]
 use ort::execution_providers::*;
 use rand::seq::IndexedRandom;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
-use tracing::{debug, error, field::Empty, info, trace};
+use tracing::{debug, error, info, trace};
+
+use std::path::Path;
+
+use image::imageops::FilterType;
+use ndarray::{Array4, ArrayView3, Ix3, Ix4, s};
+use ort::{
+    inputs,
+    session::Session,
+    value::{Tensor, TensorRef},
+};
+use show_image::event;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn init_onnx_ep() -> ort::Result<()> {
     ort::init()
@@ -54,42 +67,6 @@ pub fn init_onnx_ep() -> ort::Result<()> {
 
     Ok(())
 }
-
-use std::path::Path;
-
-use image::imageops::FilterType;
-use ndarray::{Array4, ArrayView3, Ix3, Ix4, s};
-use ort::{
-    inputs,
-    session::{Session, SessionOutputs},
-    value::{Tensor, TensorRef},
-};
-use show_image::event;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use crate::utils::inputs_from_image;
-
-// Define the message type for communication between tasks
-#[derive(Debug)]
-pub(crate) struct YoloResult {
-    pub(crate) bboxes: Vec<(bbox::BoundingBox, &'static str, f32)>,
-}
-
-#[rustfmt::skip]
-const YOLO_CLASS_LABELS: [&str; 80] = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
-    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush"
-];
-// The YOLO models are hard coded to this size.
-const SIZE_X: u32 = 640;
-const SIZE_Y: u32 = 640;
 
 fn main() -> ort::Result<()> {
     tracing_subscriber::registry()
@@ -137,12 +114,13 @@ async fn async_main() -> ort::Result<()> {
     let (img_width, img_height) = (img.width(), img.height());
 
     // Create channel for communication between YOLO task and main thread
-    let (yolo_tx, mut yolo_rx) = mpsc::channel::<YoloResult>(1);
+    let (yolo_tx, mut yolo_rx) = mpsc::channel::<yolo::YoloResult>(1);
 
-    let img_yolo = img.resize_exact(SIZE_X, SIZE_Y, FilterType::CatmullRom);
+    let img_yolo = img.resize_exact(yolo::SIZE_X, yolo::SIZE_Y, FilterType::CatmullRom);
+    let (w, h) = (img.height(), img.width());
     // Spawn YOLO inference task
     tokio::spawn(async move {
-        if let Err(e) = run_yolo_inference(img_yolo, img_width, img_height, yolo_tx).await {
+        if let Err(e) = yolo::run_inference(img_yolo, w, h, yolo_tx).await {
             error!("YOLO inference error: {}", e);
         }
     });
@@ -160,6 +138,7 @@ async fn async_main() -> ort::Result<()> {
             if event.input.key_code == Some(event::VirtualKeyCode::Escape)
                 && event.input.state.is_pressed()
             {
+                debug!("EXIT");
                 break;
             }
         }
@@ -307,37 +286,4 @@ pub fn sample_top_k_from_logits(logits: ArrayView3<f32>, k: usize) -> usize {
     let &(token_idx, _) = topk.choose(&mut rng).unwrap();
 
     token_idx
-}
-
-async fn run_yolo_inference(
-    img: image::DynamicImage,
-    img_width: u32,
-    img_height: u32,
-    tx: mpsc::Sender<YoloResult>,
-) -> ort::Result<()> {
-    let input = inputs_from_image(&img);
-
-    let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("models")
-        .join("yolo11n.onnx");
-    let mut model = Session::builder()?.commit_from_file(model_path)?;
-
-    // Run YOLOv11 inference
-    let outputs: SessionOutputs =
-        model.run(inputs!["images" => TensorRef::from_array_view(&input)?])?;
-    let output = outputs["output0"]
-        .try_extract_array::<f32>()?
-        .t()
-        .into_owned();
-    let findings = output.slice(s![.., .., 0]);
-    let bboxes = bbox::bbox(findings, img_width, img_height);
-
-    // Send results back to main thread
-    let result = YoloResult { bboxes };
-
-    if let Err(_) = tx.send(result).await {
-        error!("Failed to send YOLO results to main thread");
-    }
-
-    Ok(())
 }

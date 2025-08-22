@@ -3,6 +3,8 @@ use ndarray::{Array, ArrayBase, Ix4, OwnedRepr};
 use raqote::DrawTarget;
 use show_image::{AsImageView, WindowOptions, WindowProxy};
 
+use crate::yolo;
+
 pub(crate) fn show_image(
     original_img: DynamicImage,
     dt: DrawTarget,
@@ -38,7 +40,7 @@ pub(crate) fn show_image(
 }
 
 pub(crate) fn inputs_from_image(img: &DynamicImage) -> ArrayBase<OwnedRepr<f32>, Ix4> {
-    let mut input = Array::zeros((1, 3, super::SIZE_X as usize, super::SIZE_Y as usize));
+    let mut input = Array::zeros((1, 3, yolo::SIZE_X as usize, yolo::SIZE_Y as usize));
     for pixel in img.pixels() {
         let x = pixel.0 as _;
         let y = pixel.1 as _;

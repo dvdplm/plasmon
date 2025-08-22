@@ -2,7 +2,7 @@ use ndarray::{ArrayBase, Axis, RemoveAxis, ViewRepr};
 use raqote::{DrawOptions, DrawTarget, LineJoin, PathBuilder, SolidSource, Source, StrokeStyle};
 use tracing::info;
 
-use super::{SIZE_X, SIZE_Y, YOLO_CLASS_LABELS};
+use super::yolo::{SIZE_X, SIZE_Y, YOLO_CLASS_LABELS};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BoundingBox {
     pub x1: f32,
