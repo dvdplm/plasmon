@@ -28,7 +28,7 @@ pub(crate) fn bbox<D: RemoveAxis>(
     let mut boxes = Vec::new();
     for row in findings.axis_iter(Axis(0)) {
         let row: Vec<_> = row.iter().copied().collect();
-        let (class_id, prob) = row
+        let (class_id, confidence) = row
             .iter()
             // skip bounding box coordinates
             .skip(4)
@@ -36,7 +36,7 @@ pub(crate) fn bbox<D: RemoveAxis>(
             .map(|(index, value)| (index, *value))
             .reduce(|accum, row| if row.1 > accum.1 { row } else { accum })
             .unwrap();
-        if prob < 0.2 {
+        if confidence < 0.2 {
             continue;
         }
         let label = YOLO_CLASS_LABELS[class_id];
@@ -53,7 +53,7 @@ pub(crate) fn bbox<D: RemoveAxis>(
                 y2: yc + h / 2.,
             },
             label,
-            prob,
+            confidence,
         ));
     }
 

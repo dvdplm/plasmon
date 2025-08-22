@@ -93,8 +93,30 @@ async fn async_main() -> ort::Result<()> {
 
     // Channel for new JPG paths
     let (img_tx, mut img_rx) = mpsc::channel::<std::path::PathBuf>(10);
+
+    // Channel for YoloResult to trigger Gemma-3 inference
+    let (yoloresult_tx, mut yoloresult_rx) =
+        mpsc::channel::<Vec<(bbox::BoundingBox, &'static str, f32)>>(10);
     // Create channel for communication between YOLO task and main thread
     let (yolo_tx, mut yolo_rx) = mpsc::channel::<yolo::YoloResult>(1);
+
+    // Spawn Gemma-3 inference task
+    tokio::spawn(async move {
+        while let Some(bboxes) = yoloresult_rx.recv().await {
+            // Collect unique labels from bboxes
+            let mut ingredients: Vec<&str> = bboxes.iter().map(|(_, label, _)| *label).collect();
+            ingredients.sort();
+            ingredients.dedup();
+            let prompt = format!(
+                "<bos><start_of_turn>user\nYou are a helpful assistant.\n\nWrite a recipe using the following ingredients: {}<end_of_turn>\n<start_of_turn>model\n",
+                ingredients.join(", ")
+            );
+            info!("Gemma-3 prompt: {}", prompt);
+            if let Err(e) = run_gemma3_inference(Box::leak(prompt.into_boxed_str())).await {
+                error!("Gemma-3 inference error: {}", e);
+            }
+        }
+    });
 
     // Spawn filesystem watcher for 'data' folder, passing sender
     tokio::spawn(watch_data_folder(img_tx));
@@ -139,36 +161,22 @@ async fn async_main() -> ort::Result<()> {
     //         }
     //     });
 
-    // let img = image::open(
-    //     Path::new(env!("CARGO_MANIFEST_DIR"))
-    //         .join("data")
-    //         .join("skate-3654.jpg"),
-    //     // .join("boywithgun.jpg"),
-    //     // .join("baseball.jpg"),
-    // )
-    // .unwrap();
-
-    // let (img_width, img_height) = (img.width(), img.height());
-
-    // let img_yolo = img.resize_exact(yolo::SIZE_X, yolo::SIZE_Y, FilterType::CatmullRom);
-    // let (w, h) = (img.height(), img.width());
-    // Spawn YOLO inference task
-    // tokio::spawn(async move {
-    //     if let Err(e) = yolo::run_inference(img_yolo, w, h, yolo_tx).await {
-    //         error!("YOLO inference error: {}", e);
-    //     }
-    // });
-
+    debug!("Waiting for YOLO results");
     let yolo = yolo_rx
         .recv()
         .await
         .expect("Failed to receive YOLO results");
-
+    trace!("Got YOLO results");
     // TODO: kind of sucks to re-open the image like this.
     let img = image::open(yolo.img_path).unwrap();
+
+    // Gemma3 inference here
+    let labels = yolo.bboxes.clone();
+    yoloresult_tx.send(labels).await.unwrap();
+
+    // Show image
     let dt = bbox::draw_bboxes(yolo.bboxes, yolo.width, yolo.height);
     let window = utils::show_image(img, dt, yolo.width, yolo.height);
-
     for event in window.event_channel().unwrap() {
         if let event::WindowEvent::KeyboardInput(event) = event {
             trace!("EVENT: {event:?}");
@@ -186,6 +194,7 @@ async fn async_main() -> ort::Result<()> {
 
 // Async filesystem watcher for 'data' folder, sends new JPG paths via channel
 async fn watch_data_folder(tx: mpsc::Sender<std::path::PathBuf>) -> NotifyResult<()> {
+    debug!("Watching for files in data/");
     let (event_tx, mut event_rx) = tokio_mpsc::channel(10);
 
     // Spawn a blocking thread for the watcher
@@ -209,6 +218,7 @@ async fn watch_data_folder(tx: mpsc::Sender<std::path::PathBuf>) -> NotifyResult
         if let EventKind::Create(CreateKind::File) = event.kind {
             for path in event.paths {
                 if path.exists() {
+                    trace!("File seen with path: {path:?}");
                     if let Some(ext) = path.extension() {
                         if ext.to_string_lossy().eq_ignore_ascii_case("jpg") {
                             let _ = tx.send(path.clone()).await;
@@ -251,7 +261,7 @@ async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
     const EOT_TOKEN_ID: i64 = 106;
     let mut pos_id_arr = [0i64; 1];
     let mut kvs = empty_kv_cache(1);
-    for step in 0..90 {
+    for step in 0..200 {
         let (input_ids, position_ids) = if step == 0 {
             (
                 TensorRef::from_array_view((vec![1, tokens.len() as i64], tokens.as_slice()))?,

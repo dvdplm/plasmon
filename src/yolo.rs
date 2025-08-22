@@ -9,7 +9,7 @@ use ort::{
     value::TensorRef,
 };
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, info, trace};
 
 #[rustfmt::skip]
 pub(crate) const YOLO_CLASS_LABELS: [&str; 80] = [
@@ -29,7 +29,7 @@ pub(crate) const SIZE_X: u32 = 640;
 pub(crate) const SIZE_Y: u32 = 640;
 
 // Define the message type for communication between tasks
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct YoloResult {
     pub(crate) bboxes: Vec<(bbox::BoundingBox, &'static str, f32)>,
     pub(crate) width: u32,
@@ -50,6 +50,7 @@ pub(crate) async fn run_inference(
         .join("models")
         .join("yolo11n.onnx");
     let mut model = Session::builder()?.commit_from_file(model_path)?;
+    info!("YOLO model loaded");
 
     // Run YOLOv11 inference
     let outputs: SessionOutputs =
@@ -68,7 +69,7 @@ pub(crate) async fn run_inference(
         height,
         img_path,
     };
-
+    trace!("YOLO inference done. Sending results back");
     if let Err(_) = tx.send(result).await {
         error!("Failed to send YOLO results to main thread");
     }
