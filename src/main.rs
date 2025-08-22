@@ -135,6 +135,7 @@ async fn async_main() -> ort::Result<()> {
 
     for event in window.event_channel().unwrap() {
         if let event::WindowEvent::KeyboardInput(event) = event {
+            trace!("EVENT: {event:?}");
             if event.input.key_code == Some(event::VirtualKeyCode::Escape)
                 && event.input.state.is_pressed()
             {
@@ -166,7 +167,7 @@ async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
     // println!("===============================");
 
     debug!("Built Gemma session");
-
+    tokio::task::yield_now().await;
     let tokenizer = Tokenizer::from_file(base_path.join("tokenizer.json"))?;
     debug!("Tokenizer ready");
     let tokens = tokenizer.encode(input, false)?;
@@ -176,7 +177,7 @@ async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
     const EOT_TOKEN_ID: i64 = 106;
     let mut pos_id_arr = [0i64; 1];
     let mut kvs = empty_kv_cache(1);
-    for step in 0..900 {
+    for step in 0..90 {
         let (input_ids, position_ids) = if step == 0 {
             (
                 TensorRef::from_array_view((vec![1, tokens.len() as i64], tokens.as_slice()))?,
@@ -252,6 +253,7 @@ async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
         let output_ids = tokens.iter().map(|&id| id as u32).collect::<Vec<_>>();
         let gentext = tokenizer.decode(&output_ids, false).unwrap();
         info!("Step {step}: generated text: {gentext}");
+        tokio::task::yield_now().await;
     }
 
     Ok(())
