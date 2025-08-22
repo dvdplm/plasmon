@@ -5,9 +5,10 @@ mod utils;
 
 #[allow(unused)]
 use ort::execution_providers::*;
+use rand::seq::IndexedRandom;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
-use tracing::{debug, error, field::Empty, trace};
+use tracing::{debug, error, field::Empty, info, trace};
 
 pub fn init_onnx_ep() -> ort::Result<()> {
     ort::init()
@@ -54,14 +55,14 @@ pub fn init_onnx_ep() -> ort::Result<()> {
     Ok(())
 }
 
-use std::{collections::HashMap, net::ToSocketAddrs, path::Path};
+use std::path::Path;
 
 use image::imageops::FilterType;
-use ndarray::{Array2, Array3, Array4, s};
+use ndarray::{Array4, ArrayView3, Ix3, Ix4, s};
 use ort::{
     inputs,
-    session::{Session, SessionInputs, SessionOutputs},
-    value::TensorRef,
+    session::{Session, SessionOutputs},
+    value::{Tensor, TensorRef},
 };
 use show_image::event;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -113,7 +114,13 @@ async fn async_main() -> ort::Result<()> {
 
     // Gemma-3 inference here
     tokio::spawn(async move {
-        if let Err(e) = run_gemma3_inference("something smart here").await {
+        let gemma_query = "<bos><start_of_turn>user
+        You are a helpful assistant.
+
+        Write down instructions for cooking pasta.<end_of_turn>
+        <start_of_turn>model
+";
+        if let Err(e) = run_gemma3_inference(gemma_query).await {
             error!("Gemma-3 inference error: {}", e);
         }
     });
@@ -133,12 +140,12 @@ async fn async_main() -> ort::Result<()> {
     let (yolo_tx, mut yolo_rx) = mpsc::channel::<YoloResult>(1);
 
     let img_yolo = img.resize_exact(SIZE_X, SIZE_Y, FilterType::CatmullRom);
-    // // Spawn YOLO inference task
-    // tokio::spawn(async move {
-    //     if let Err(e) = run_yolo_inference(img_yolo, img_width, img_height, yolo_tx).await {
-    //         error!("YOLO inference error: {}", e);
-    //     }
-    // });
+    // Spawn YOLO inference task
+    tokio::spawn(async move {
+        if let Err(e) = run_yolo_inference(img_yolo, img_width, img_height, yolo_tx).await {
+            error!("YOLO inference error: {}", e);
+        }
+    });
 
     let yolo_result = yolo_rx
         .recv()
@@ -164,20 +171,20 @@ async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
     let base_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("models")
         .join("gemma-3-1b-it-ONNX");
-    let model_path = base_path.join("onnx/model_int8.onnx");
+    let model_path = base_path.join("onnx/model_uint8.onnx");
+    // let model_path = base_path.join("onnx/model.onnx");
     let mut model = Session::builder()?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level1)?
         .commit_from_file(model_path)?;
 
-    // INSPECT MODEL TO SEE WHAT INPUTS IT ACTUALLY NEEDS
-    println!("=== MODEL INPUTS REQUIRED ===");
-    for (i, input) in model.inputs.iter().enumerate() {
-        println!(
-            "  Input {}: '{}' | Type: {:?} ",
-            i, input.name, input.input_type
-        );
-    }
-    println!("===============================");
+    // println!("=== MODEL INPUTS REQUIRED ===");
+    // for (i, input) in model.inputs.iter().enumerate() {
+    //     println!(
+    //         "  Input {}: '{}' | Type: {:?} ",
+    //         i, input.name, input.input_type
+    //     );
+    // }
+    // println!("===============================");
 
     debug!("Built Gemma session");
 
@@ -186,33 +193,120 @@ async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
     let tokens = tokenizer.encode(input, false)?;
     trace!("Tokens: {tokens:?}");
     let mut tokens: Vec<_> = tokens.get_ids().iter().map(|i| *i as i64).collect();
-
-    for step in 0..90 {
-        let input_ids =
-            TensorRef::from_array_view((vec![1, tokens.len() as i64], tokens.as_slice()))?;
-        let pos_ids = (0..tokens.len() as i64).collect::<Vec<_>>();
-        let position_ids =
-            TensorRef::from_array_view((vec![1, tokens.len() as i64], pos_ids.as_slice()))?;
+    const EOS_TOKEN_ID: i64 = 1;
+    const EOT_TOKEN_ID: i64 = 106;
+    let mut pos_id_arr = [0i64; 1];
+    let mut kvs = empty_kv_cache(1);
+    for step in 0..900 {
+        let (input_ids, position_ids) = if step == 0 {
+            (
+                TensorRef::from_array_view((vec![1, tokens.len() as i64], tokens.as_slice()))?,
+                Tensor::from_array((
+                    vec![1, tokens.len() as i64],
+                    (1..=tokens.len() as i64).collect::<Vec<_>>(),
+                ))?,
+            )
+        } else {
+            pos_id_arr[0] = tokens.len() as i64;
+            (
+                TensorRef::from_array_view((
+                    vec![1, 1i64],
+                    std::slice::from_ref(tokens.last().unwrap()),
+                ))?,
+                Tensor::from_array((vec![1, 1i64], pos_id_arr[..].to_vec()))?,
+            )
+        };
 
         let mut session_inputs = inputs![
             "input_ids" => input_ids,
             "position_ids" => position_ids,
         ];
-        let past_seq_len = if step == 0 { 0 } else { tokens.len() - 1 };
-        let empty_kv = Array4::<f32>::zeros((1, 1, past_seq_len, 256));
 
         for layer in 0..26 {
             let key = format!("past_key_values.{}.key", layer);
-            let kv = TensorRef::from_array_view(&empty_kv)?;
-            session_inputs.push((key.into(), kv.clone().into()));
+            let kv = TensorRef::from_array_view(&kvs[layer].0)?;
+            session_inputs.push((key.into(), kv.into()));
+            let kv = TensorRef::from_array_view(&kvs[layer].1)?;
             let val = format!("past_key_values.{}.value", layer);
             session_inputs.push((val.into(), kv.into()));
         }
+
         let outputs = model.run(session_inputs)?;
-        trace!("Output: {outputs:?}");
+        trace!(
+            "Step {step}: Got output, effective length: {:?}",
+            outputs.len()
+        );
+
+        let logits = outputs["logits"]
+            .try_extract_array::<f32>()?
+            .into_dimensionality::<Ix3>()
+            .unwrap();
+
+        let next_token_id = sample_top_k_from_logits(logits.view(), 5) as i64;
+        trace!("Step {step}: Next token id: {next_token_id}");
+
+        // Update kv cache from outputs
+        for layer in 0..26 {
+            let present_key = outputs[format!("present.{layer}.key")]
+                .try_extract_array::<f32>()?
+                .into_dimensionality::<Ix4>()
+                .unwrap();
+            let present_value = outputs[format!("present.{layer}.value")]
+                .try_extract_array::<f32>()?
+                .into_dimensionality::<Ix4>()
+                .unwrap();
+            // trace!(
+            //     "Step {step}: Layer {}: present_key shape {:?}, present_value shape {:?}",
+            //     layer,
+            //     present_key.shape(),
+            //     present_value.shape()
+            // );
+            kvs[layer].0 = present_key.to_owned();
+            kvs[layer].1 = present_value.to_owned();
+        }
+
+        if next_token_id == EOS_TOKEN_ID || next_token_id == EOT_TOKEN_ID {
+            info!("Step {step}: Done responding");
+            break;
+        }
+        tokens.push(next_token_id);
+        let output_ids = tokens.iter().map(|&id| id as u32).collect::<Vec<_>>();
+        let gentext = tokenizer.decode(&output_ids, false).unwrap();
+        info!("Step {step}: generated text: {gentext}");
     }
 
     Ok(())
+}
+
+fn empty_kv_cache(past_seq_len: usize) -> Vec<(Array4<f32>, Array4<f32>)> {
+    let mut cache = Vec::with_capacity(26);
+    for _ in 0..26 {
+        cache.push((
+            Array4::<f32>::zeros((1, 1, past_seq_len, 256)),
+            Array4::<f32>::zeros((1, 1, past_seq_len, 256)),
+        ));
+    }
+    cache
+}
+
+/// Samples a token from the top-k logits for the last token in the sequence.
+/// Returns the token index (usize).
+pub fn sample_top_k_from_logits(logits: ArrayView3<f32>, k: usize) -> usize {
+    // Get the logits for the last token in the batch (assuming batch size 1)
+    let vocab_logits = logits.slice(s![0, -1, ..]);
+    let mut indexed_logits: Vec<(usize, f32)> = vocab_logits.iter().cloned().enumerate().collect();
+
+    // Sort descending by logit value
+    indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Take top-k
+    let topk = &indexed_logits[..k];
+    // trace!("tok-k tokens: {topk:?}");
+    // Sample randomly from top-k
+    let mut rng = rand::rng();
+    let &(token_idx, _) = topk.choose(&mut rng).unwrap();
+
+    token_idx
 }
 
 async fn run_yolo_inference(
