@@ -11,7 +11,9 @@ use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace};
 
+use notify::{EventKind, RecursiveMode, Result as NotifyResult, Watcher, event::CreateKind};
 use std::path::Path;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use image::imageops::FilterType;
 use ndarray::{Array4, ArrayView3, Ix3, Ix4, s};
@@ -89,18 +91,25 @@ async fn async_main() -> ort::Result<()> {
     // Register ONNX execution providers (EPs) based on feature flags.
     init_onnx_ep()?;
 
-    // Gemma-3 inference here
-    tokio::spawn(async move {
-        let gemma_query = "<bos><start_of_turn>user
-        You are a helpful assistant.
-
-        Write down instructions for cooking pasta.<end_of_turn>
-        <start_of_turn>model
-";
-        if let Err(e) = run_gemma3_inference(gemma_query).await {
-            error!("Gemma-3 inference error: {}", e);
+    // Spawn filesystem watcher for 'data' folder
+    tokio::spawn(async {
+        if let Err(e) = watch_data_folder().await {
+            error!("FS watch error: {:?}", e);
         }
     });
+
+    //     // Gemma-3 inference here
+    //     tokio::spawn(async move {
+    //         let gemma_query = "<bos><start_of_turn>user
+    //         You are a helpful assistant.
+
+    //         Write down instructions for cooking pasta.<end_of_turn>
+    //         <start_of_turn>model
+    // ";
+    //         if let Err(e) = run_gemma3_inference(gemma_query).await {
+    //             error!("Gemma-3 inference error: {}", e);
+    //         }
+    //     });
 
     let img = image::open(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -119,11 +128,11 @@ async fn async_main() -> ort::Result<()> {
     let img_yolo = img.resize_exact(yolo::SIZE_X, yolo::SIZE_Y, FilterType::CatmullRom);
     let (w, h) = (img.height(), img.width());
     // Spawn YOLO inference task
-    tokio::spawn(async move {
-        if let Err(e) = yolo::run_inference(img_yolo, w, h, yolo_tx).await {
-            error!("YOLO inference error: {}", e);
-        }
-    });
+    // tokio::spawn(async move {
+    //     if let Err(e) = yolo::run_inference(img_yolo, w, h, yolo_tx).await {
+    //         error!("YOLO inference error: {}", e);
+    //     }
+    // });
 
     let yolo_result = yolo_rx
         .recv()
@@ -147,6 +156,46 @@ async fn async_main() -> ort::Result<()> {
 
     Ok(())
 }
+
+// Async filesystem watcher for 'data' folder
+async fn watch_data_folder() -> NotifyResult<()> {
+    let (tx, mut rx) = tokio_mpsc::channel(10);
+
+    // Spawn a blocking thread for the watcher
+    std::thread::spawn(move || {
+        let mut watcher = notify::recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = tx.blocking_send(event);
+            }
+        })
+        .unwrap();
+
+        watcher
+            .watch(Path::new("data"), RecursiveMode::NonRecursive)
+            .unwrap();
+
+        // Keep the thread alive
+        std::thread::park();
+    });
+
+    while let Some(event) = rx.recv().await {
+        if let EventKind::Create(CreateKind::File) = event.kind {
+            for path in event.paths {
+                // Only flag if the file exists and is a jpg
+                if path.exists() {
+                    if let Some(ext) = path.extension() {
+                        if ext.to_string_lossy().eq_ignore_ascii_case("jpg") {
+                            debug!("New jpg file detected: {:?}", path);
+                            // Here you would trigger YOLO inference
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_gemma3_inference(input: &'static str) -> ort::Result<()> {
     let base_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("models")
